@@ -1,0 +1,157 @@
+image: docker:latest
+
+services:
+  - docker:dind
+
+variables:
+  AWS_DEFAULT_REGION: us-east-1
+  ECR_REGISTRY: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com
+  ECR_REPOSITORY: example-app
+  IMAGE_TAG: $CI_COMMIT_SHORT_SHA
+
+stages:
+  - Build
+  - Unit Test
+  - Quality gates
+  - Docker Build
+  - Deploy to DEV
+  - Release Version
+  - Deploy to QA
+  - Deploy to STAGING
+  - Deploy to PRODUCTION
+
+before_script:
+  - apk add --no-cache curl jq python3 py3-pip
+  - pip3 install awscli
+  - curl -LO "https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl"
+  - chmod +x ./kubectl
+  - mv ./kubectl /usr/local/bin/kubectl
+  - curl -LO https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv3.8.7/kustomize_v3.8.7_linux_amd64.tar.gz
+  - tar -xzf kustomize_v3.8.7_linux_amd64.tar.gz
+  - mv kustomize /usr/local/bin/kustomize
+
+Build source code:
+  stage: Build
+  script:
+    - ./gradlew clean build
+  artifacts:
+    paths:
+      - build/libs/*.jar
+
+Unit-tests:
+  stage: Unit Test
+  script:
+    - ./gradlew test
+  needs:
+    - job: Build source code
+
+SonarQube analysis:
+  stage: Quality gates
+  script:
+    - ./gradlew sonarqube -Dsonar.projectKey=$SONAR_PROJECT_KEY -Dsonar.host.url=$SONAR_HOST_URL -Dsonar.login=$SONAR_TOKEN
+    - echo "SonarQube analysis completed. Checking quality gate..."
+    - |
+      QUALITY_GATE_STATUS=$(curl -s -u $SONAR_TOKEN: $SONAR_HOST_URL/api/qualitygates/project_status?projectKey=$SONAR_PROJECT_KEY | jq -r '.projectStatus.status')
+      if [ "$QUALITY_GATE_STATUS" != "OK" ]; then
+        echo "SonarQube Quality Gate failed. Status: $QUALITY_GATE_STATUS"
+        exit 1
+      else
+        echo "SonarQube Quality Gate passed."
+      fi
+  needs:
+    - job: Build source code
+
+Docker Build and Prisma scan:
+  stage: Docker Build
+  script:
+    - docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+    - echo "Installing Prisma CLI..."
+    - npm install -g @prisma/cli
+    - echo "Running Prisma security scan..."
+    - prisma scan --image $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG --output prisma-report.json
+    - echo "Checking for high-severity issues..."
+    - if grep -q 'severity: HIGH' prisma-report.json; then exit 1; fi
+    - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
+    - docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+  needs:
+    - job: SonarQube analysis
+
+DEV Deployment:
+  stage: Deploy to DEV
+  script:
+    - aws eks update-kubeconfig --name $EKS_CLUSTER_NAME_DEV --region $AWS_DEFAULT_REGION
+    - kustomize edit set image example-app=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+    - kustomize build k8s/overlays/dev | kubectl apply -f -
+  environment:
+    name: dev
+  needs:
+    - job: Docker Build and Prisma scan
+
+Release Version:
+  stage: Release Version
+  cache:
+    key: tag-cache
+    paths:
+      - releaseTag.txt
+  script:
+    # Proceed with tagging and pushing the Docker image
+    - export TAG=$(./gradlew -q printVersion)
+    - echo "$TAG" > releaseTag.txt
+    - git tag "$TAG" "$CI_COMMIT_SHORT_SHA"
+    - git push origin $TAG
+    - docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:$TAG
+    - docker push $ECR_REGISTRY/$ECR_REPOSITORY:$TAG
+  only:
+    - tags
+  needs:
+    - job: DEV Deployment
+
+QA Deployment:
+  stage: Deploy to QA
+  cache:
+    key: tag-cache
+    paths:
+      - releaseTag.txt
+  script:
+    - aws eks update-kubeconfig --name $EKS_CLUSTER_NAME_QA --region $AWS_DEFAULT_REGION
+    - if [-e releaseTag.txt]; then TAG=$(cat releaseTag.txt) ; else exit 1 ; fi
+    - kustomize edit set image example-app=$ECR_REGISTRY/$ECR_REPOSITORY:$TAG
+    - kustomize build k8s/overlays/qa | kubectl apply -f -
+  environment:
+    name: qa
+  needs:
+    - job: Release Version
+
+Staging Deployment:
+  stage: Deploy to STAGING
+  cache:
+    key: tag-cache
+    paths:
+      - releaseTag.txt
+  script:
+    - aws eks update-kubeconfig --name $EKS_CLUSTER_NAME_STAGING --region $AWS_DEFAULT_REGION
+    - if [-e releaseTag.txt]; then TAG=$(cat releaseTag.txt) ; else exit 1 ; fi
+    - kustomize edit set image example-app=$ECR_REGISTRY/$ECR_REPOSITORY:$TAG
+    - kustomize build k8s/overlays/staging | kubectl apply -f -
+  environment:
+    name: staging
+  needs:
+    - job: QA Deployment
+  when: manual
+
+Prod Deployment:
+  stage: Deploy to PRODUCTION
+  cache:
+    key: tag-cache
+    paths:
+      - releaseTag.txt
+  script:
+    - aws eks update-kubeconfig --name $EKS_CLUSTER_NAME_PROD --region $AWS_DEFAULT_REGION
+    - if [-e releaseTag.txt]; then TAG=$(cat releaseTag.txt) ; else exit 1 ; fi
+    - kustomize edit set image example-app=$ECR_REGISTRY/$ECR_REPOSITORY:$TAG
+    - kustomize build k8s/overlays/prod | kubectl apply -f -
+  environment:
+    name: prod
+  needs:
+    - job: STAGING Deployment
+  when: manual
