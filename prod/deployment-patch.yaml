@@ -1,0 +1,11 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: example-app
+spec:
+  replicas: 4
+  template:
+    spec:
+      containers:
+      - name: example-app
+        image: example-app:$TAG
